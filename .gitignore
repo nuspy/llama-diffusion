@@ -1,0 +1,22 @@
+# engine: clone esterno + artefatti di build (enormi)
+engine/llama.cpp/
+
+# modelli
+models/*.gguf
+
+# config locale generata dall'installer (modello/ctx scelti)
+config.json
+
+# python
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node / electron
+gui/node_modules/
+gui/dist/
+
+# runtime
+.temp/
+*.log

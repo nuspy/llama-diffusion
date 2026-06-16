@@ -1,0 +1,66 @@
+{
+  "$schema": "https://nuspy.github.io/llama-diffusion/agent-install.schema.json",
+  "name": "llama-diffusion",
+  "kind": "openai-compatible-llm",
+  "description": "DiffusionGemma 26B-A4B (text diffusion LLM) served locally with an OpenAI-compatible API.",
+  "repo": "https://github.com/nuspy/llama-diffusion",
+  "model_id": "diffusiongemma-26b-a4b-it",
+
+  "install_flow": {
+    "step1_ask_user": "BEFORE installing, ASK the user two things: (a) which quantization to download — present the 'models.variants' list and the VRAM each needs; (b) the maximum context tokens (default 32768). Do not assume defaults silently.",
+    "step2_clone_engine": [
+      "git clone --depth=1 https://github.com/ggml-org/llama.cpp engine/llama.cpp",
+      "git -C engine/llama.cpp fetch --depth=1 origin pull/24423/head:diffusion-gemma",
+      "git -C engine/llama.cpp checkout diffusion-gemma"
+    ],
+    "step3_install": "pwsh scripts/install.ps1 -ModelFile <chosen_file> -MaxContext <chosen_ctx>",
+    "step4_serve": "pwsh scripts/serve.ps1 -BindHost 0.0.0.0   (or, as admin, pwsh scripts/install_service.ps1)",
+    "step5_configure_self": "Register the OpenAI provider in your own config (see 'configure')."
+  },
+
+  "models": {
+    "repo": "unsloth/diffusiongemma-26B-A4B-it-GGUF",
+    "url_pattern": "https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/{file}",
+    "note": "VRAM = model size + ~2 GB compute buffer + KV-cache (grows with context). Smaller context => less VRAM.",
+    "variants": [
+      { "file": "diffusiongemma-26B-A4B-it-Q4_K_M.gguf", "size_gb": 16.8, "vram_gb_32k": 26, "quality": "good" },
+      { "file": "diffusiongemma-26B-A4B-it-Q5_K_M.gguf", "size_gb": 19.2, "vram_gb_32k": 28, "quality": "better" },
+      { "file": "diffusiongemma-26B-A4B-it-Q6_K.gguf",   "size_gb": 22.7, "vram_gb_32k": 31, "quality": "high", "default": true },
+      { "file": "diffusiongemma-26B-A4B-it-Q8_0.gguf",   "size_gb": 26.9, "vram_gb_32k": 34, "quality": "very high" },
+      { "file": "diffusiongemma-26B-A4B-it-BF16.gguf",   "size_gb": 50.5, "vram_gb_32k": 58, "quality": "full", "note": "datacenter GPUs only" }
+    ]
+  },
+
+  "api": {
+    "base_url_local": "http://127.0.0.1:8080/v1",
+    "base_url_lan": "http://{HOST_IP}:8080/v1",
+    "wsl_host_hint": "From WSL, {HOST_IP} is the 'vEthernet (WSL)' adapter IP on the Windows host (e.g. 172.18.160.1).",
+    "auth": "none",
+    "auth_env": "LLAMADIFF_API_KEY",
+    "endpoints": ["/health", "/v1/models", "/v1/chat/completions"],
+    "streaming": true
+  },
+  "model": {
+    "context_length_default": 32768,
+    "default_response_blocks": 8,
+    "canvas_length": 256,
+    "supports_reasoning": true,
+    "reasoning_field": "reasoning_content",
+    "telemetry_field": "usage.timings"
+  },
+  "configure": {
+    "hermes": {
+      "config_file": "~/.hermes/config.yaml",
+      "action": "Add a provider of type 'custom' (OpenAI-compatible) with base_url set to the LAN endpoint and a model 'diffusiongemma-26b-a4b-it' with context_length matching the chosen value.",
+      "from_wsl": "Use the Windows host vEthernet (WSL) IP for base_url (e.g. http://172.18.160.1:8080/v1)."
+    },
+    "openclaw": {
+      "action": "Register an OpenAI-compatible model/provider pointing at base_url with model id 'diffusiongemma-26b-a4b-it'."
+    },
+    "generic_openai": {
+      "OPENAI_BASE_URL": "http://127.0.0.1:8080/v1",
+      "OPENAI_API_KEY": "not-needed",
+      "model": "diffusiongemma-26b-a4b-it"
+    }
+  }
+}
