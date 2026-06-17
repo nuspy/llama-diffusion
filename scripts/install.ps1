@@ -30,6 +30,14 @@ if (-not (Test-Path (Join-Path $engine ".git"))) {
     git -C $engine checkout diffusion-gemma
 }
 
+# 1b. apply the incremental-decode fix (NOT upstream): fast long prompts + no crash at small ubatch
+$patch = Join-Path $root "patches\diffusion-gemma-incremental-decode.patch"
+if (Test-Path $patch) {
+    git -C $engine apply --check $patch 2>$null
+    if ($LASTEXITCODE -eq 0) { git -C $engine apply $patch; Write-Host ">> applied incremental-decode patch" -ForegroundColor Cyan }
+    else { Write-Host ">> incremental-decode patch already applied or N/A (skip)" -ForegroundColor DarkGray }
+}
+
 # 2. build the CUDA engine (handles VS-toolset / _CL_ / C++17 gotchas)
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot "build_engine.ps1") }
 

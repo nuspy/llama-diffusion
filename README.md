@@ -29,8 +29,18 @@ git clone https://github.com/nuspy/llama-diffusion
 cd llama-diffusion
 # pass the user's choices to the installer:
 pwsh scripts/install.ps1 -ModelFile diffusiongemma-26B-A4B-it-Q6_K.gguf -MaxContext 32768
-pwsh scripts/serve.ps1 -BindHost 0.0.0.0   # API on :8080 (reachable from WSL)
-#   …or install it as an always-on Windows service (admin): scripts/install_service.ps1
+
+# Run the engine. For an agent (Hermes/OpenCLAW) that needs it ALWAYS-ON, install the
+# Windows SERVICE (recommended): it binds 0.0.0.0:8787 AND opens the firewall automatically
+# so WSL can reach it. From an ADMIN PowerShell (or use the self-elevating one-liner below):
+pwsh scripts/install_service.ps1
+#   …or just run it in the foreground instead (also 0.0.0.0:8787):
+#   pwsh scripts/serve.ps1 -BindHost 0.0.0.0
+```
+
+Self-elevating install of the service (opens a UAC prompt, no need to open an admin shell):
+```powershell
+Start-Process pwsh -Verb RunAs -ArgumentList '-ExecutionPolicy','Bypass','-File','scripts/install_service.ps1'
 ```
 
 Then **configure yourself to use it**. The machine-readable descriptor
@@ -39,14 +49,14 @@ config snippets). In short, register an OpenAI provider:
 
 | field | value |
 |---|---|
-| `base_url` | `http://127.0.0.1:8080/v1` (local) or `http://<host-ip>:8080/v1` (from WSL/another host) |
+| `base_url` | `http://127.0.0.1:8787/v1` (local) or `http://<host-ip>:8787/v1` (from WSL/another host) |
 | `model` | `diffusiongemma-26b-a4b-it` |
 | `api_key` | none (unless you set `LLAMADIFF_API_KEY`) |
 | streaming | yes (SSE) |
 | reasoning | exposed in `reasoning_content` (separate from `content`) |
 
 - **Hermes**: add a provider in `~/.hermes/config.yaml` pointing `base_url` at the endpoint
-  (from WSL, the Windows host is reachable at the *vEthernet (WSL)* IP, e.g. `172.18.160.1:8080`).
+  (from WSL, the Windows host is reachable at the *vEthernet (WSL)* IP, e.g. `172.18.160.1:8787`).
 - **OpenCLAW / others**: point the custom/OpenAI provider at the same `base_url` and model id.
 
 > "install this project" implies **both** installing the engine **and** wiring it into the
@@ -76,10 +86,9 @@ exactly the trade-off the agent should help the user pick in Step 0.
 - **Inference engine** — patched `llama.cpp` (PR #24423) running `DiffusionGemma 26B-A4B` (Q6_K GGUF, ~21 GB).
 - **OpenAI-compatible API** — `GET /v1/models`, `POST /v1/chat/completions` (streaming + non-streaming),
   with diffusion telemetry (tokens/s, denoising steps, timings) in `usage.timings`.
-- **Desktop GUI** *(in development)* — chat with reasoning panel, live engine parameters,
-  and a model downloader (pick a DiffusionGemma quantization to fetch).
-- **System-tray controller** *(in development)* — unload model, preload model, open GUI,
-  open settings, quit.
+- **Desktop GUI + system tray** — chat with reasoning panel and per-message telemetry, plus a
+  tray icon (open GUI · preload · unload · settings · quit). Launch with `start_diffusion_engine`.
+- **Model downloader in the GUI** *(in development)* — pick a DiffusionGemma quantization to fetch.
 - **Smart VRAM lifecycle** *(in development)* — see [VRAM coordination](#vram-coordination).
 
 ---
@@ -109,6 +118,9 @@ git clone --depth=1 https://github.com/ggml-org/llama.cpp engine/llama.cpp
 git -C engine/llama.cpp fetch --depth=1 origin pull/24423/head:diffusion-gemma
 git -C engine/llama.cpp checkout diffusion-gemma
 
+# 2b. apply the incremental-decode fix (fast long prompts, no crash at small ubatch)
+git -C engine/llama.cpp apply patches/diffusion-gemma-incremental-decode.patch
+
 # 3. build the CUDA engine (handles the VS-toolset / _CL_ / C++17 gotchas automatically)
 pwsh scripts/build_engine.ps1
 
@@ -122,7 +134,7 @@ python -m playwright install chromium      # for the browser tool
 #        diffusiongemma-26B-A4B-it-Q6_K.gguf --local-dir models
 
 # 6. run the API
-pwsh scripts/serve.ps1        # http://127.0.0.1:8080
+pwsh scripts/serve.ps1        # http://127.0.0.1:8787
 ```
 
 Quick smoke test of the raw engine (no API):
@@ -137,7 +149,7 @@ python agent/engine.py -p "Write a Python function for factorial." --blocks 2 -v
 The API is OpenAI-compatible, so existing clients work unchanged:
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+curl http://127.0.0.1:8787/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "diffusiongemma-26b-a4b-it",
   "messages": [{"role":"user","content":"Explain diffusion LLMs in one sentence."}],
   "stream": true
@@ -151,30 +163,54 @@ Notes specific to this engine:
   so the default leaves room for the final answer.
 - `temperature`/`top_p` are accepted for compatibility; the sampler uses the model's
   entropy-bound schedule.
+- **JIT model loading** (LM Studio style): `GET /v1/models` lists every `.gguf` in `models/`
+  (loaded or not); the model named in a request is loaded into VRAM on demand and the previous
+  one is unloaded. The first request to a cold model waits for the (minutes-long) load.
 
-### Running as a Windows service (always-on)
+### Running as a Windows service (always-on) — recommended for agents
+
+Best option for Hermes/OpenCLAW: a headless, always-up engine. Installing a service needs admin,
+so use the self-elevating one-liner (opens a UAC prompt):
 
 ```powershell
-# from an ADMIN PowerShell:
-pwsh scripts/install_service.ps1
+Start-Process pwsh -Verb RunAs -ArgumentList '-ExecutionPolicy','Bypass','-File','E:\Projects\llama-diffusion\scripts\install_service.ps1'
 ```
-Installs an auto-start service `llamadiff` on `0.0.0.0:8080` (reachable by Hermes on WSL).
+…or run `pwsh scripts/install_service.ps1` from an already-admin PowerShell.
+
+It installs an auto-start service **`llamadiff`** that:
+- binds **`0.0.0.0:8787`** — Hermes on WSL reaches it at `http://172.18.160.1:8787/v1`;
+- **opens TCP 8787 in Windows Firewall** automatically (so WSL/LAN can connect);
+- loads the model **on first request** (JIT — no VRAM used while idle).
+
+Manage it:
+```powershell
+Get-Service llamadiff           # status
+Stop-Service llamadiff          # stop (frees VRAM)
+Start-Service llamadiff         # start
+curl http://127.0.0.1:8787/health
+nssm remove llamadiff confirm   # uninstall (admin)
+```
+The service is **headless** (no tray/GUI). For the desktop chat + tray, use the GUI below.
+Don't run the service and `start_diffusion_engine` at the same time — same port 8787.
 
 ---
 
-## Desktop GUI *(in development)*
+## Desktop GUI + system tray
 
-An Electron app with a Python sidecar:
-- chat with the model, with a collapsible **reasoning** panel;
-- live **engine parameters** (context length, response length, denoising steps, flash-attn);
-- per-message **telemetry** (time-to-first-output, tokens/s);
-- a **model downloader**: if no DiffusionGemma model is installed, browse available
-  quantizations (Q4_K_M, Q5, Q6_K, Q8…) and download one.
-
-## System tray *(in development)*
-
-A hidden-icons (system tray) controller with:
+An Electron app (chat + tray). Launch it:
+```powershell
+.\start_diffusion_engine.ps1        # or double-click start_diffusion_engine.bat
+```
+This starts the engine **and** shows a **system-tray icon** (in the hidden-icons overflow `^` —
+drag it onto the taskbar to pin it). Right-click the icon for:
 **Open GUI · Preload model · Unload model · Settings · Quit.**
+The chat **window opens from the tray icon** (left-click or *Open GUI*), with a collapsible
+**reasoning** panel and per-message **telemetry** (tokens/s, denoising steps).
+
+> The GUI runs the engine as a sidecar bound to `0.0.0.0:8787`. For WSL access also open the
+> firewall once (the service does this for you): `New-NetFirewallRule -DisplayName "llama-diffusion 8787" -Direction Inbound -LocalPort 8787 -Protocol TCP -Action Allow` (admin).
+
+*Still in development:* the in-GUI **model downloader** and the automatic **VRAM release** below.
 
 ## VRAM coordination *(in development)*
 

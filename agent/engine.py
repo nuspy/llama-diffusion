@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,8 @@ log = logging.getLogger("engine")
 
 # Radice del progetto: .../llama-diffusion
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SERVER = ROOT / "engine" / "llama.cpp" / "build" / "bin" / "llama-diffusion-gemma-visual-server.exe"
+_EXE = ".exe" if sys.platform == "win32" else ""
+DEFAULT_SERVER = ROOT / "engine" / "llama.cpp" / "build" / "bin" / f"llama-diffusion-gemma-visual-server{_EXE}"
 DEFAULT_MODEL = ROOT / "models" / "diffusiongemma-26B-A4B-it-Q6_K.gguf"
 TEMP_DIR = ROOT / ".temp"
 
@@ -47,13 +49,15 @@ class EngineConfig:
     server_exe: Path = DEFAULT_SERVER
     model_path: Path = DEFAULT_MODEL
     ngl: int = 99          # layer su GPU (il modello ha 30 blocchi: 99 = tutto in VRAM)
-    maxtok: int = 32768    # contesto. Grazie a ubatch (sotto), il compute buffer e' disaccoppiato dal contesto:
-                           # 32768 ctx + ubatch 2048 -> buffer ~2 GB, ~94 tok/s (VERIFICATO su RTX 5090).
-                           # NON usare 0/auto: con ubatch=ctx sceglie 12288 -> buffer 12 GB -> spilla -> ~2 tok/s.
+    maxtok: int = 262144   # contesto = massimo del modello (n_ctx_train = 262144 = 256K), richiesto da Hermes
+                           # (minimo 64K). Con ubatch 2048 il compute buffer resta ~2 GB; la KV-cache pero'
+                           # cresce col contesto e a 256K puo' eccedere i 32 GB di VRAM (spilling/OOM al load).
     fa: bool = False       # flash attention (da verificare sul path di diffusione non-causale)
-    ubatch: int = 2048     # DG_UBATCH: cap del micro-batch fisico. 2048 = ottimo equilibrio (copre prompt
-                           # iniziali fino a ~1800 token + canvas 256, e tiene il buffer ~2 GB). La patch al
-                           # visual-server rende il buffer ~lineare in ubatch, non in n_ctx.
+    ubatch: int = 2048     # DG_UBATCH: cap del micro-batch fisico. Dopo il fix C++ in diffusion-gemma.cpp
+                           # (KV-store del prompt in F16 + decode canvas-only senza re-concat + pad della KV a
+                           # multipli di 256 per la flash-attn CUDA sui layer global), il DECODE non rielabora
+                           # piu' il prompt a ogni passo: prompt lunghi (5K+ token, es. Hermes) girano a ~40 tok/s
+                           # con ubatch piccolo. 2048 = buffer ~2 GB, gestisce prompt lunghi senza crash/lentezza.
 
 
 def load_engine_config() -> "EngineConfig":
@@ -72,6 +76,8 @@ def load_engine_config() -> "EngineConfig":
             cfg.maxtok = int(data["maxtok"])
         if data.get("ubatch") is not None:
             cfg.ubatch = int(data["ubatch"])
+        if data.get("fa") is not None:
+            cfg.fa = bool(data["fa"])
     return cfg
 
 
@@ -98,15 +104,35 @@ class DiffusionEngine:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()       # il protocollo accetta una richiesta per volta
         self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_fh = None               # file handle del log stderr del subprocess
         self._req_counter = 0
         self.n_vocab: int = 0
         self.maxtok: int = 0
+        self.current_model: Optional[Path] = None   # modello attualmente in VRAM (JIT)
 
     # ---- ciclo di vita -------------------------------------------------
 
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def ensure_loaded(self, model_path) -> None:
+        """JIT (stile LM Studio): carica `model_path` se non gia' caricato; se ne e' caricato
+        un altro, lo scarica prima. Bloccante (il load puo' richiedere minuti la prima volta)."""
+        model_path = Path(model_path)
+        if self.running and self.current_model == model_path:
+            return
+        if self.running:
+            self.stop()
+        self.current_model = None
+        self.cfg.model_path = model_path
+        self.start()
+        self.current_model = model_path
+
+    def unload(self) -> None:
+        """Scarica il modello dalla VRAM (lifecycle / tray)."""
+        self.stop()
+        self.current_model = None
 
     def start(self, ready_timeout: float = 600.0) -> None:
         """Avvia il server e attende la riga READY (il load del modello puo' richiedere minuti)."""
@@ -128,22 +154,32 @@ class DiffusionEngine:
 
         log.info("avvio server: %s %s (NGL=%s MAXTOK=%s FA=%s DG_UBATCH=%s)",
                  exe.name, model.name, env["NGL"], env["MAXTOK"], env["FA"], env["DG_UBATCH"])
+        # IMPORTANTE: pipe in modalita' BINARIA (niente text=/encoding=/bufsize=1). Su Windows il
+        # text-mode TextIOWrapper con bufsize=1 sui pipe e' fragile (traduzione \r\n, line-buffering
+        # che non si applica davvero ai pipe, write che possono fallire con [Errno 22] dopo che il
+        # peer e' morto). Gestiamo noi UTF-8 e i newline a mano: e' deterministico e portabile.
+        # stderr -> file di log, cosi' un eventuale crash del subprocess (CUDA/assert/access violation)
+        # resta visibile invece di sparire in log.debug.
+        self._stderr_fh = open(TEMP_DIR / "visual-server.err.log", "ab", buffering=0)
+        try:
+            self._stderr_fh.write(
+                f"\n===== avvio {exe.name} {model.name} "
+                f"(NGL={env['NGL']} MAXTOK={env['MAXTOK']} FA={env['FA']} DG_UBATCH={env['DG_UBATCH']}) =====\n"
+                .encode("utf-8")
+            )
+        except OSError:
+            pass
         self._proc = subprocess.Popen(
             [str(exe), str(model)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_fh,    # il subprocess scrive stderr direttamente sul file (no thread/pipe)
             env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,                 # line-buffered
+            # bufsize default (-1): pipe binari = BufferedWriter(stdin)/BufferedReader(stdout). readline()
+            # affidabile su stdout; sullo stdin facciamo flush() esplicito dopo ogni write. NIENTE text=
+            # ne' bufsize=1 (la combinazione fragile su Windows da cui nasceva [Errno 22]).
             cwd=str(ROOT),
         )
-
-        # drena stderr in un thread (diagnostica del server: sizing contesto, ecc.)
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._stderr_thread.start()
 
         # attende READY <n_vocab> <MAXTOK>
         deadline = threading.Event()
@@ -151,8 +187,8 @@ class DiffusionEngine:
 
         def _wait_ready():
             assert self._proc and self._proc.stdout
-            for line in self._proc.stdout:
-                line = line.rstrip("\r\n")
+            for raw in self._proc.stdout:           # raw e' bytes (pipe binario)
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line.startswith("READY"):
                     parts = line.split()
                     if len(parts) >= 3:
@@ -175,28 +211,39 @@ class DiffusionEngine:
         log.info("server pronto: n_vocab=%d MAXTOK=%d", self.n_vocab, self.maxtok)
 
     def stop(self) -> None:
-        if not self._proc:
+        proc = self._proc
+        if not proc:
             return
         try:
-            if self._proc.poll() is None and self._proc.stdin:
+            if proc.poll() is None and proc.stdin:
                 try:
-                    self._proc.stdin.write("QUIT\n")
-                    self._proc.stdin.flush()
+                    proc.stdin.write(b"QUIT\n")    # pipe binario
+                    proc.stdin.flush()
                 except (OSError, ValueError):
                     pass
                 try:
-                    self._proc.wait(timeout=10)
+                    proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    self._proc.kill()
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            # chiudi gli handle del pipe per non lasciarli aperti
+            for fh in (proc.stdin, proc.stdout):
+                try:
+                    if fh:
+                        fh.close()
+                except OSError:
+                    pass
         finally:
             self._proc = None
-
-    def _drain_stderr(self) -> None:
-        proc = self._proc
-        if not proc or not proc.stderr:
-            return
-        for line in proc.stderr:
-            log.debug("[server] %s", line.rstrip())
+            if self._stderr_fh:
+                try:
+                    self._stderr_fh.close()
+                except OSError:
+                    pass
+                self._stderr_fh = None
 
     # ---- generazione ---------------------------------------------------
 
@@ -218,22 +265,43 @@ class DiffusionEngine:
             raise EngineError("server non avviato (chiama start())")
 
         with self._lock:
+            # ricontrolla DENTRO il lock: il subprocess potrebbe essere morto tra il check e qui.
+            # Fallire pulito (senza scrivere su un pipe morto -> [Errno 22]) e' meglio che restartare
+            # in silenzio: il chiamante decide se ritentare.
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                code = proc.poll() if proc else None
+                raise EngineError(
+                    f"il visual-server e' terminato (exit={code}); vedi {TEMP_DIR / 'visual-server.err.log'}"
+                )
+            assert proc.stdin and proc.stdout
+
             self._req_counter += 1
             req_path = TEMP_DIR / f"req_{os.getpid()}_{self._req_counter}.json"
             payload = {"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}
-            req_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            # Scrivi, flusha e CHIUDI il file prima di mandarne il path: il C++ fa fopen()+fread() del
+            # file, quindi i byte devono essere gia' sul disco (chiuso) prima che riceva il path.
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            with open(req_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
 
-            assert self._proc and self._proc.stdin and self._proc.stdout
             try:
-                self._proc.stdin.write(str(req_path) + "\n")
-                self._proc.stdin.flush()
-            except (OSError, ValueError) as e:
-                raise EngineError(f"impossibile scrivere la richiesta al server: {e}") from e
+                proc.stdin.write(str(req_path).encode("utf-8") + b"\n")
+                proc.stdin.flush()
+            except (OSError, ValueError, BrokenPipeError) as e:
+                req_path.unlink(missing_ok=True)
+                raise EngineError(
+                    f"impossibile scrivere la richiesta al server (subprocess morto?): {e}; "
+                    f"vedi {TEMP_DIR / 'visual-server.err.log'}"
+                ) from e
 
             result = GenerationResult()
+            terminated = False        # ha visto DONE o ERR? altrimenti stdout chiuso = subprocess morto
             try:
-                for raw in self._proc.stdout:
-                    line = raw.rstrip("\r\n")
+                for raw in proc.stdout:                       # raw e' bytes
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
                     if not line:
                         continue
                     tag = line[0]
@@ -259,10 +327,12 @@ class DiffusionEngine:
                     elif line.startswith("STATS"):
                         result.stats = _parse_stats(line)
                     elif line == "DONE":
+                        terminated = True
                         break
                     elif line.startswith("ERR"):
                         result.stop_reason = "error"
                         result.error = line[3:].strip()
+                        terminated = True
                         # mantieni leggere fino a DONE se presente, ma ERR e' terminale
                         break
                     elif line.startswith("READY"):
@@ -273,6 +343,15 @@ class DiffusionEngine:
                 except OSError:
                     pass
 
+            if not terminated:
+                # stdout chiuso senza DONE/ERR: il subprocess e' crashato durante la generazione.
+                # NON ritentare in silenzio: chiudi e segnala (con exit code + puntatore al log).
+                code = proc.poll()
+                self.stop()
+                raise EngineError(
+                    f"il visual-server e' crashato durante la generazione (exit={code}); "
+                    f"vedi {TEMP_DIR / 'visual-server.err.log'}"
+                )
             if result.error:
                 raise EngineError(result.error)
             # stop_reason: se ha generato tutti i blocchi richiesti senza eog -> probabile troncamento

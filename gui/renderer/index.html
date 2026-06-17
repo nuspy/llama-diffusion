@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <title>DiffusionGemma</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="left">
+      <strong>DiffusionGemma</strong>
+      <span id="status" class="status">…</span>
+    </div>
+    <div class="right">
+      <label>Modello
+        <select id="model"></select>
+      </label>
+      <button id="load">Carica</button>
+      <button id="settingsBtn" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <section id="settings" class="settings hidden">
+    <h3>Settings</h3>
+    <label>Max token risposta
+      <input id="maxtok" type="number" value="1024" min="64" step="256" />
+    </label>
+    <p class="hint">Il contesto e i parametri del motore (es. n_ctx, ubatch) si impostano in
+      <code>config.json</code> / installer e richiedono il riavvio del motore.</p>
+  </section>
+
+  <main id="chat"></main>
+
+  <footer>
+    <textarea id="input" rows="2" placeholder="Scrivi un messaggio…  (Invio per inviare, Shift+Invio per a capo)"></textarea>
+    <button id="send">Invia</button>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

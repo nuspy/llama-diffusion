@@ -1,0 +1,12 @@
+{
+  "name": "llama-diffusion-gui",
+  "version": "0.1.0",
+  "description": "Desktop chat GUI + system-tray controller for the DiffusionGemma engine",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
