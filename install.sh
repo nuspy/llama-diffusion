@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 MODEL_FILE="${1:-diffusiongemma-26B-A4B-it-Q6_K.gguf}"
-MAX_CTX="${2:-32768}"
+MAX_CTX="${2:-262144}"
 REPO="unsloth/diffusiongemma-26B-A4B-it-GGUF"
 
 # 1. diffusion-capable llama.cpp fork (PR #24423)

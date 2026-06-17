@@ -6,14 +6,14 @@
   chosen model file + context are persisted to config.json and picked up by the engine.
 
   Examples:
-    pwsh scripts/install.ps1                                        # defaults: Q6_K, 32768 ctx
+    pwsh scripts/install.ps1                                        # defaults: Q6_K, 262144 ctx
     pwsh scripts/install.ps1 -ModelFile diffusiongemma-26B-A4B-it-Q4_K_M.gguf -MaxContext 16384
     pwsh scripts/install.ps1 -SkipModel                            # everything but the download
 #>
 param(
     [string]$ModelRepo  = "unsloth/diffusiongemma-26B-A4B-it-GGUF",
     [string]$ModelFile  = "diffusiongemma-26B-A4B-it-Q6_K.gguf",
-    [int]$MaxContext    = 32768,
+    [int]$MaxContext    = 262144,
     [int]$Ubatch        = 2048,
     [switch]$SkipModel,
     [switch]$SkipBuild

@@ -7,27 +7,28 @@
   "model_id": "diffusiongemma-26b-a4b-it",
 
   "install_flow": {
-    "step1_ask_user": "BEFORE installing, ASK the user two things: (a) which quantization to download — present the 'models.variants' list and the VRAM each needs; (b) the maximum context tokens (default 32768). Do not assume defaults silently.",
+    "step1_ask_user": "BEFORE installing, ASK the user two things: (a) which quantization to download — present the 'models.variants' list and the VRAM each needs; (b) the maximum context tokens (default 262144 = model max; Hermes requires >= 64000). Do not assume defaults silently.",
     "step2_clone_engine": [
       "git clone --depth=1 https://github.com/ggml-org/llama.cpp engine/llama.cpp",
       "git -C engine/llama.cpp fetch --depth=1 origin pull/24423/head:diffusion-gemma",
-      "git -C engine/llama.cpp checkout diffusion-gemma"
+      "git -C engine/llama.cpp checkout diffusion-gemma",
+      "git -C engine/llama.cpp apply patches/diffusion-gemma-incremental-decode.patch"
     ],
-    "step3_install": "pwsh scripts/install.ps1 -ModelFile <chosen_file> -MaxContext <chosen_ctx>",
-    "step4_serve": "pwsh scripts/serve.ps1 -BindHost 0.0.0.0   (or, as admin, pwsh scripts/install_service.ps1)",
-    "step5_configure_self": "Register the OpenAI provider in your own config (see 'configure')."
+    "step3_install": "pwsh scripts/install.ps1 -ModelFile <chosen_file> -MaxContext <chosen_ctx>   (clones+patches the engine, builds CUDA, installs deps, downloads the model, writes config.json)",
+    "step4_serve": "pwsh scripts/serve.ps1 -BindHost 0.0.0.0   (or, as admin, pwsh scripts/install_service.ps1 — auto-start service on 0.0.0.0:8787 + opens the firewall)",
+    "step5_configure_self": "Register ONLY the provider in your own config (see 'configure'). Do NOT hand-register the model: its id and context_length are auto-discovered via GET /v1/models."
   },
 
   "models": {
     "repo": "unsloth/diffusiongemma-26B-A4B-it-GGUF",
     "url_pattern": "https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/{file}",
-    "note": "VRAM = model size + ~2 GB compute buffer + KV-cache (grows with context). Smaller context => less VRAM.",
+    "note": "vram_gb_approx = model size + ~2 GB compute buffer + KV-cache. KV is small (sliding-window attention) so VRAM is nearly context-independent here.",
     "variants": [
-      { "file": "diffusiongemma-26B-A4B-it-Q4_K_M.gguf", "size_gb": 16.8, "vram_gb_32k": 26, "quality": "good" },
-      { "file": "diffusiongemma-26B-A4B-it-Q5_K_M.gguf", "size_gb": 19.2, "vram_gb_32k": 28, "quality": "better" },
-      { "file": "diffusiongemma-26B-A4B-it-Q6_K.gguf",   "size_gb": 22.7, "vram_gb_32k": 31, "quality": "high", "default": true },
-      { "file": "diffusiongemma-26B-A4B-it-Q8_0.gguf",   "size_gb": 26.9, "vram_gb_32k": 34, "quality": "very high" },
-      { "file": "diffusiongemma-26B-A4B-it-BF16.gguf",   "size_gb": 50.5, "vram_gb_32k": 58, "quality": "full", "note": "datacenter GPUs only" }
+      { "file": "diffusiongemma-26B-A4B-it-Q4_K_M.gguf", "size_gb": 16.8, "vram_gb_approx": 20, "quality": "good" },
+      { "file": "diffusiongemma-26B-A4B-it-Q5_K_M.gguf", "size_gb": 19.2, "vram_gb_approx": 22, "quality": "better" },
+      { "file": "diffusiongemma-26B-A4B-it-Q6_K.gguf",   "size_gb": 22.7, "vram_gb_approx": 26, "quality": "high", "default": true },
+      { "file": "diffusiongemma-26B-A4B-it-Q8_0.gguf",   "size_gb": 26.9, "vram_gb_approx": 30, "quality": "very high" },
+      { "file": "diffusiongemma-26B-A4B-it-BF16.gguf",   "size_gb": 50.5, "vram_gb_approx": 54, "quality": "full", "note": "datacenter GPUs only" }
     ]
   },
 
@@ -37,11 +38,12 @@
     "wsl_host_hint": "From WSL, {HOST_IP} is the 'vEthernet (WSL)' adapter IP on the Windows host (e.g. 172.18.160.1).",
     "auth": "none",
     "auth_env": "LLAMADIFF_API_KEY",
-    "endpoints": ["/health", "/v1/models", "/v1/chat/completions"],
-    "streaming": true
+    "endpoints": ["/health", "/v1/models", "/v1/chat/completions", "/admin/load", "/admin/unload"],
+    "streaming": true,
+    "discovery": "GET /v1/models returns each model id plus its context_length / max_model_len — so registering the provider is enough; the model is found automatically."
   },
   "model": {
-    "context_length_default": 32768,
+    "context_length_default": 262144,
     "default_response_blocks": 8,
     "canvas_length": 256,
     "supports_reasoning": true,
@@ -49,18 +51,20 @@
     "telemetry_field": "usage.timings"
   },
   "configure": {
+    "note": "Register ONLY the provider (base_url). The model id and its context are discovered via GET /v1/models — never pin a context_length by hand (a wrong value, e.g. 32768, makes Hermes reject the model for being below its 64000 minimum).",
     "hermes": {
       "config_file": "~/.hermes/config.yaml",
-      "action": "Add a provider of type 'custom' (OpenAI-compatible) with base_url set to the LAN endpoint and a model 'diffusiongemma-26b-a4b-it' with context_length matching the chosen value.",
+      "action": "Add ONLY a provider (type 'custom', OpenAI-compatible) with base_url set to the endpoint. No 'models' block — Hermes discovers the model and its context via /v1/models.",
+      "example": "providers:\n  diffusiongemma:\n    base_url: http://172.18.160.1:8787/v1\n    api_key: not-needed",
       "from_wsl": "Use the Windows host vEthernet (WSL) IP for base_url (e.g. http://172.18.160.1:8787/v1)."
     },
     "openclaw": {
-      "action": "Register an OpenAI-compatible model/provider pointing at base_url with model id 'diffusiongemma-26b-a4b-it'."
+      "action": "Register ONLY an OpenAI-compatible provider pointing at base_url. The model is auto-discovered via /v1/models; do not pin model metadata."
     },
     "generic_openai": {
       "OPENAI_BASE_URL": "http://127.0.0.1:8787/v1",
       "OPENAI_API_KEY": "not-needed",
-      "model": "diffusiongemma-26b-a4b-it"
+      "model": "optional — omit to use the loaded model, or read it from GET /v1/models"
     }
   }
 }

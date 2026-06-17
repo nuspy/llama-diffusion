@@ -200,8 +200,12 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
+    # expose context_length so an agent only needs to register the PROVIDER (base_url):
+    # the model id and its context are auto-discovered here, no hand-registration needed.
+    ctx = load_engine_config().maxtok
     return {"object": "list", "data": [
-        {"id": m["id"], "object": "model", "owned_by": "local", "created": 0}
+        {"id": m["id"], "object": "model", "owned_by": "local", "created": 0,
+         "context_length": ctx, "max_model_len": ctx}
         for m in list_local_models()
     ]}
 
